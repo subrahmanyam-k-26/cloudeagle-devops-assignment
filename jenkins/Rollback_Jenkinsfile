@@ -1,0 +1,144 @@
+/*
+ * Rollback job for sync-service
+ *
+ * Takes an image tag and environment, redeploys that version.
+ * Use this when a deploy went through but the app is misbehaving.
+ */
+
+def resolveEcsService(String env) {
+    switch (env) {
+        case 'qa':      return 'sync-service-qa'
+        case 'staging': return 'sync-service-staging'
+        case 'prod':    return 'sync-service-prod'
+        default:        error "Unknown env: ${env}"
+    }
+}
+
+pipeline {
+    agent {
+        docker {
+            image 'eclipse-temurin:17-jdk'
+            args  '-v /var/run/docker.sock:/var/run/docker.sock'
+        }
+    }
+
+    parameters {
+        string(name: 'IMAGE_TAG', defaultValue: '', description: 'ECR image tag to roll back to (e.g. develop-a1b2c3d)', trim: true)
+        choice(name: 'TARGET_ENV', choices: ['qa', 'staging', 'prod'], description: 'Which environment to roll back')
+    }
+
+    environment {
+        AWS_REGION   = 'us-east-1'
+        ECR_REGISTRY = credentials('ecr-registry-url')
+        ECR_REPO     = 'sync-service'
+        ECS_CLUSTER  = 'cloudeagle-cluster'
+    }
+
+    options {
+        timestamps()
+        timeout(time: 20, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    stages {
+
+        stage('Validate') {
+            steps {
+                script {
+                    if (!params.IMAGE_TAG?.trim()) {
+                        error 'IMAGE_TAG is required.'
+                    }
+                    echo "Rolling back ${params.TARGET_ENV} to ${params.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Resolve') {
+            steps {
+                script {
+                    env.ECS_SERVICE = resolveEcsService(params.TARGET_ENV)
+                    env.FULL_IMAGE  = "${ECR_REGISTRY}/${ECR_REPO}:${params.IMAGE_TAG}"
+                    env.TASK_FAMILY = "sync-service-${params.TARGET_ENV}"
+                }
+            }
+        }
+
+        stage('Update Task Definition') {
+            steps {
+                sh """
+                    aws ecs describe-task-definition --task-definition ${env.TASK_FAMILY} --region ${AWS_REGION} --query 'taskDefinition' > current-task-def.json
+
+                    cat current-task-def.json | python3 -c "
+import sys, json
+td = json.load(sys.stdin)
+td['containerDefinitions'][0]['image'] = '${env.FULL_IMAGE}'
+keep = ['family','containerDefinitions','taskRoleArn','executionRoleArn','networkMode','volumes','placementConstraints','requiresCompatibilities','cpu','memory','runtimePlatform']
+out = {k: td[k] for k in keep if k in td}
+print(json.dumps(out))
+" > new-task-def.json
+
+                    aws ecs register-task-definition --region ${AWS_REGION} --cli-input-json file://new-task-def.json
+                """
+            }
+            post { failure { echo 'Task def update failed — does that image tag exist in ECR?' } }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh """
+                    aws ecs update-service \
+                        --cluster ${ECS_CLUSTER} \
+                        --service ${env.ECS_SERVICE} \
+                        --task-definition ${env.TASK_FAMILY} \
+                        --region ${AWS_REGION} \
+                        --force-new-deployment
+                """
+            }
+            post { failure { echo "Rollback deploy failed for ${params.TARGET_ENV}." } }
+        }
+
+        stage('Wait for Stability') {
+            steps {
+                sh "aws ecs wait services-stable --cluster ${ECS_CLUSTER} --services ${env.ECS_SERVICE} --region ${AWS_REGION}"
+                echo "Service is stable."
+            }
+            post { failure { echo "Service didn't stabilize — check ECS console." } }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: "alb-url-${params.TARGET_ENV}", variable: 'ALB_URL')]) {
+                        def code = sh(script: "curl -sf -o /dev/null -w '%{http_code}' ${ALB_URL}/actuator/health", returnStdout: true).trim()
+                        if (code != '200') {
+                            error "Health check returned ${code} after rollback"
+                        }
+                        echo "Health check passed"
+                    }
+                }
+            }
+        }
+
+        stage('Notify') {
+            steps {
+                slackSend(
+                    channel: '#deployments',
+                    color: 'warning',
+                    message: "Rolled back sync-service on ${params.TARGET_ENV} to ${params.IMAGE_TAG} — <${env.BUILD_URL}|build #${env.BUILD_NUMBER}>"
+                )
+            }
+        }
+    }
+
+    post {
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "Rollback FAILED: sync-service on ${params.TARGET_ENV} to ${params.IMAGE_TAG} — <${env.BUILD_URL}|build #${env.BUILD_NUMBER}>"
+            )
+        }
+        always { cleanWs() }
+    }
+}

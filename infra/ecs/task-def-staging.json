@@ -1,0 +1,45 @@
+{
+  "family": "sync-service-staging",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/sync-service-staging-execution-role",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/sync-service-staging-task-role",
+  "containerDefinitions": [
+    {
+      "name": "sync-service",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/sync-service:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "SPRING_DATA_MONGODB_URI",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:cloudeagle/staging/mongodb-uri"
+        },
+        {
+          "name": "API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:cloudeagle/staging/api-key"
+        },
+        {
+          "name": "SPRING_PROFILES_ACTIVE",
+          "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/cloudeagle/staging/config/spring-profiles-active"
+        }
+      ],
+      "environment": [],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/cloudeagle/staging/sync-service",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "family": "sync-service-prod",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/sync-service-prod-execution-role",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/sync-service-prod-task-role",
+  "containerDefinitions": [
+    {
+      "name": "sync-service",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/sync-service:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "SPRING_DATA_MONGODB_URI",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:cloudeagle/prod/mongodb-uri"
+        },
+        {
+          "name": "API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:cloudeagle/prod/api-key"
+        },
+        {
+          "name": "SPRING_PROFILES_ACTIVE",
+          "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/cloudeagle/prod/config/spring-profiles-active"
+        }
+      ],
+      "environment": [],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/cloudeagle/prod/sync-service",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

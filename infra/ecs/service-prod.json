@@ -1,0 +1,50 @@
+{
+  "serviceName": "sync-service-prod",
+  "cluster": "cloudeagle-cluster",
+  "taskDefinition": "sync-service-prod",
+  "launchType": "FARGATE",
+  "desiredCount": 2,
+  "deploymentConfiguration": {
+    "minimumHealthyPercent": 50,
+    "maximumPercent": 200,
+    "deploymentCircuitBreaker": {
+      "enable": true,
+      "rollback": true
+    }
+  },
+  "healthCheckGracePeriodSeconds": 60,
+  "networkConfiguration": {
+    "awsvpcConfiguration": {
+      "subnets": [
+        "subnet-xxxxxxxxxxxxxxxxx",
+        "subnet-yyyyyyyyyyyyyyyyy"
+      ],
+      "securityGroups": [
+        "sg-xxxxxxxxxxxxxxxxx"
+      ],
+      "assignPublicIp": "DISABLED"
+    }
+  },
+  "loadBalancers": [
+    {
+      "targetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/sync-service-prod-tg/xxxxxxxxxxxxxxxxx",
+      "containerName": "sync-service",
+      "containerPort": 8080
+    }
+  ],
+  "schedulingStrategy": "REPLICA",
+  "_autoScalingConfiguration": {
+    "_comment": "Auto-scaling is configured via AWS Application Auto Scaling, not in the ECS service definition. Included here for reference.",
+    "minCapacity": 2,
+    "maxCapacity": 6,
+    "targetTrackingScalingPolicy": {
+      "policyName": "sync-service-prod-cpu-scaling",
+      "targetValue": 60.0,
+      "predefinedMetricSpecification": {
+        "predefinedMetricType": "ECSServiceAverageCPUUtilization"
+      },
+      "scaleInCooldown": 300,
+      "scaleOutCooldown": 60
+    }
+  }
+}

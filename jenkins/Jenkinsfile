@@ -1,0 +1,289 @@
+/*
+ * sync-service CI/CD pipeline
+ *
+ * Branches map to environments like this:
+ *   feature/*  -> CI only (build + test)
+ *   develop    -> QA
+ *   release/*  -> Staging
+ *   main       -> Production (needs manual approval)
+ */
+
+def resolveEnvironment(String branchName) {
+    if (branchName == 'develop') {
+        return 'qa'
+    } else if (branchName.startsWith('release/')) {
+        return 'staging'
+    } else if (branchName == 'main') {
+        return 'prod'
+    }
+    return '' // feature branches etc — no deploy target
+}
+
+def resolveEcsService(String env) {
+    switch (env) {
+        case 'qa':      return 'sync-service-qa'
+        case 'staging': return 'sync-service-staging'
+        case 'prod':    return 'sync-service-prod'
+        default:        return ''
+    }
+}
+
+pipeline {
+    agent {
+        docker {
+            image 'eclipse-temurin:17-jdk'
+            args  '-v /var/run/docker.sock:/var/run/docker.sock'
+        }
+    }
+
+    environment {
+        AWS_REGION     = 'us-east-1'
+        ECR_REGISTRY   = credentials('ecr-registry-url')
+        ECR_REPO       = 'sync-service'
+        ECS_CLUSTER    = 'cloudeagle-cluster'
+        SONAR_HOST_URL = credentials('sonar-host-url')
+        SONAR_TOKEN    = credentials('sonar-token')
+        DEPLOY_ENV     = ''
+        IMAGE_TAG      = ''
+    }
+
+    options {
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    stages {
+
+        // --- PR stages: run on pull requests only ---
+
+        stage('PR: Checkout') {
+            when { changeRequest() }
+            steps { checkout scm }
+            post { failure { echo 'Checkout failed — check repo access.' } }
+        }
+
+        stage('PR: Build') {
+            when { changeRequest() }
+            steps {
+                sh 'chmod +x gradlew'
+                sh './gradlew build -x test --no-daemon'
+            }
+            post { failure { echo 'Build failed.' } }
+        }
+
+        stage('PR: Unit Tests') {
+            when { changeRequest() }
+            steps { sh './gradlew test --no-daemon' }
+            post {
+                always { junit allowEmptyResults: true, testResults: '**/build/test-results/test/*.xml' }
+                failure { echo 'Unit tests failed.' }
+            }
+        }
+
+        stage('PR: Integration Tests') {
+            when { changeRequest() }
+            steps { sh './gradlew integrationTest --no-daemon' }
+            post {
+                always { junit allowEmptyResults: true, testResults: '**/build/test-results/integrationTest/*.xml' }
+                failure { echo 'Integration tests failed — check Testcontainers setup.' }
+            }
+        }
+
+        stage('PR: Static Analysis') {
+            when { changeRequest() }
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh './gradlew sonarqube --no-daemon'
+                }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+            post { failure { echo 'Quality gate failed — check SonarQube.' } }
+        }
+
+        stage('PR: Docker Build') {
+            when { changeRequest() }
+            steps {
+                script {
+                    // just verify the Dockerfile works, don't push anything
+                    docker.build("${ECR_REPO}:pr-${env.CHANGE_ID}-${env.GIT_COMMIT.take(7)}")
+                }
+            }
+            post { failure { echo 'Docker build failed.' } }
+        }
+
+        // --- Merge stages: run when code lands on develop/release/main ---
+
+        stage('Merge: Resolve Environment') {
+            when { not { changeRequest() } }
+            steps {
+                script {
+                    env.DEPLOY_ENV = resolveEnvironment(env.BRANCH_NAME)
+                    def shortSha = env.GIT_COMMIT.take(7)
+                    def branch = env.BRANCH_NAME.replaceAll('/', '-')
+                    env.IMAGE_TAG = "${branch}-${shortSha}"
+                    echo "Target: ${env.DEPLOY_ENV ?: 'none (CI only)'}, tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Merge: Build & Tests') {
+            when { not { changeRequest() } }
+            steps {
+                sh 'chmod +x gradlew'
+                sh './gradlew build --no-daemon'
+                sh './gradlew test --no-daemon'
+                sh './gradlew integrationTest --no-daemon'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: '**/build/test-results/test/*.xml'
+                    junit allowEmptyResults: true, testResults: '**/build/test-results/integrationTest/*.xml'
+                }
+                failure { echo 'Build or tests failed on merge.' }
+            }
+        }
+
+        stage('Merge: Docker Build & Push') {
+            when {
+                allOf {
+                    not { changeRequest() }
+                    expression { env.DEPLOY_ENV != '' }
+                }
+            }
+            steps {
+                script {
+                    sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}"
+                    def img = "${ECR_REGISTRY}/${ECR_REPO}:${env.IMAGE_TAG}"
+                    sh "docker build -t ${img} ."
+                    sh "docker push ${img}"
+                    echo "Pushed ${img}"
+                }
+            }
+            post { failure { echo 'ECR push failed — check credentials.' } }
+        }
+
+        stage('Production: Approval') {
+            when {
+                allOf {
+                    branch 'main'
+                    not { changeRequest() }
+                }
+            }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input(
+                        message: 'Deploy to production?',
+                        ok: 'Approve',
+                        submitterParameter: 'APPROVED_BY'
+                    )
+                }
+            }
+            post { failure { echo 'Production deploy was rejected or timed out.' } }
+        }
+
+        stage('Merge: Deploy to ECS') {
+            when {
+                allOf {
+                    not { changeRequest() }
+                    expression { env.DEPLOY_ENV != '' }
+                }
+            }
+            steps {
+                script {
+                    def svc = resolveEcsService(env.DEPLOY_ENV)
+                    def img = "${ECR_REGISTRY}/${ECR_REPO}:${env.IMAGE_TAG}"
+                    def family = "sync-service-${env.DEPLOY_ENV}"
+
+                    // grab current image for rollback
+                    def curTaskDef = sh(
+                        script: "aws ecs describe-services --cluster ${ECS_CLUSTER} --services ${svc} --region ${AWS_REGION} --query 'services[0].taskDefinition' --output text",
+                        returnStdout: true
+                    ).trim()
+
+                    def prevImage = ''
+                    if (curTaskDef && curTaskDef != 'None') {
+                        prevImage = sh(
+                            script: "aws ecs describe-task-definition --task-definition ${curTaskDef} --region ${AWS_REGION} --query 'taskDefinition.containerDefinitions[0].image' --output text",
+                            returnStdout: true
+                        ).trim()
+                    }
+                    writeFile file: 'previous-image-tag.txt', text: prevImage
+                    archiveArtifacts artifacts: 'previous-image-tag.txt', fingerprint: true
+
+                    // update task def and deploy
+                    sh """
+                        aws ecs describe-task-definition --task-definition ${family} --region ${AWS_REGION} --query 'taskDefinition' > current-task-def.json
+
+                        cat current-task-def.json | python3 -c "
+import sys, json
+td = json.load(sys.stdin)
+td['containerDefinitions'][0]['image'] = '${img}'
+keep = ['family','containerDefinitions','taskRoleArn','executionRoleArn','networkMode','volumes','placementConstraints','requiresCompatibilities','cpu','memory','runtimePlatform']
+out = {k: td[k] for k in keep if k in td}
+print(json.dumps(out))
+" > new-task-def.json
+
+                        aws ecs register-task-definition --region ${AWS_REGION} --cli-input-json file://new-task-def.json
+                        aws ecs update-service --cluster ${ECS_CLUSTER} --service ${svc} --task-definition ${family} --region ${AWS_REGION} --force-new-deployment
+                    """
+
+                    sh "aws ecs wait services-stable --cluster ${ECS_CLUSTER} --services ${svc} --region ${AWS_REGION}"
+                    echo "Deployed to ${svc}"
+                }
+            }
+            post { failure { echo "Deploy to ${env.DEPLOY_ENV} failed — check ECS events." } }
+        }
+
+        stage('Merge: Smoke Test') {
+            when {
+                allOf {
+                    not { changeRequest() }
+                    expression { env.DEPLOY_ENV != '' }
+                }
+            }
+            steps {
+                script {
+                    withCredentials([string(credentialsId: "alb-url-${env.DEPLOY_ENV}", variable: 'ALB_URL')]) {
+                        def code = sh(script: "curl -sf -o /dev/null -w '%{http_code}' ${ALB_URL}/actuator/health", returnStdout: true).trim()
+                        if (code != '200') {
+                            error "Health check returned ${code}"
+                        }
+                        echo "Health check passed"
+                    }
+                }
+            }
+            post { failure { echo "Smoke test failed for ${env.DEPLOY_ENV} — might need a rollback." } }
+        }
+
+        stage('Merge: Notify') {
+            when {
+                allOf {
+                    not { changeRequest() }
+                    expression { env.DEPLOY_ENV != '' }
+                }
+            }
+            steps {
+                slackSend(
+                    channel: '#deployments',
+                    color: 'good',
+                    message: "Deployed sync-service to ${env.DEPLOY_ENV} (${env.IMAGE_TAG}) — <${env.BUILD_URL}|build #${env.BUILD_NUMBER}>"
+                )
+            }
+        }
+    }
+
+    post {
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "Pipeline failed: sync-service on ${env.BRANCH_NAME} — <${env.BUILD_URL}|build #${env.BUILD_NUMBER}>"
+            )
+        }
+        always { cleanWs() }
+    }
+}

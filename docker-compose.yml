@@ -1,0 +1,32 @@
+# Local dev setup — mirrors QA where MongoDB runs as a container
+services:
+  mongo:
+    image: mongo:7.0
+    container_name: sync-service-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  sync-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sync-service-app
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATA_MONGODB_URI: mongodb://mongo:27017/sync-service
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+volumes:
+  mongo-data:
